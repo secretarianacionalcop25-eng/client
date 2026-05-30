@@ -1,66 +1,71 @@
 import { NextRequest } from 'next/server';
-import { CreateAgremiadoSchema, SearchAgremiadoSchema } from '@/lib/validations';
-import {
-    handleApiError,
-    successResponse,
-    paginatedResponse,
-    ApiError,
-} from '@/lib/api-utils';
+import { handleApiError, successResponse, ApiError } from '@/lib/api-utils';
 import { verifyAdminSession } from '@/lib/auth-utils';
 import {
-    fetchAgremiadosFromSupabase,
-    createAgremiadoInSupabase,
+    bulkUpsertAgremiados,
+    type AgremiadoImportRow,
 } from '@/lib/supabase-service';
+import { parseCsvToAgremiados, parseExcelToAgremiados } from '@/lib/import-parser';
 
-/**
- * GET /api/agremiados
- * Lista agremiados con paginación (lectura pública)
- */
-export async function GET(request: NextRequest) {
-    try {
-        const searchParams = request.nextUrl.searchParams;
-        const { page, limit, q } = SearchAgremiadoSchema.parse({
-            q: searchParams.get('q') || undefined,
-            page: searchParams.get('page') || undefined,
-            limit: searchParams.get('limit') || undefined,
-        });
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
-        const { data, total } = await fetchAgremiadosFromSupabase({
-            page,
-            limit,
-            q,
-        });
-
-        return paginatedResponse(data, total, page, limit);
-    } catch (error) {
-        return handleApiError(error);
-    }
-}
-
-/**
- * POST /api/agremiados
- * Crear agremiado (solo admin)
- */
 export async function POST(request: NextRequest) {
     try {
         const isAdmin = await verifyAdminSession();
         if (!isAdmin) {
-            throw new ApiError(403, 'No autorizado');
+            throw new ApiError(403, 'Debe iniciar sesión para importar datos');
         }
 
-        const body = await request.json();
-        const validatedData = CreateAgremiadoSchema.parse(body);
+        const formData = await request.formData();
+        const file = formData.get('file') as File | null;
+        if (!file) {
+            throw new ApiError(400, 'No se envió ningún archivo');
+        }
 
-        const newAgremiado = await createAgremiadoInSupabase({
-            cop: validatedData.cop,
-            nombres: validatedData.nombres,
-            apellidos: validatedData.apellidos,
-            colegio: String(validatedData.colegio),
-            estado: validatedData.estado,
-            habilitado: validatedData.habilitado,
+        if (file.size > MAX_FILE_SIZE) {
+            throw new ApiError(
+                400,
+                `El archivo supera el límite de ${MAX_FILE_SIZE / 1024 / 1024} MB`
+            );
+        }
+
+        const mimeType = file.type;
+        const name = file.name.toLowerCase();
+        const isCsv = mimeType === 'text/csv' || name.endsWith('.csv');
+        const isExcel =
+            mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+            mimeType === 'application/vnd.ms-excel' ||
+            name.endsWith('.xlsx') ||
+            name.endsWith('.xls');
+
+        if (!isCsv && !isExcel) {
+            throw new ApiError(400, 'Formato no soportado. Use archivos .csv, .xlsx o .xls');
+        }
+
+        const buffer = Buffer.from(await file.arrayBuffer());
+        let records: AgremiadoImportRow[];
+
+        if (isCsv) {
+            records = parseCsvToAgremiados(buffer.toString('utf-8'));
+        } else {
+            records = parseExcelToAgremiados(buffer);
+        }
+
+        if (records.length === 0) {
+            throw new ApiError(
+                400,
+                'No se encontraron registros válidos. Verifique que el archivo tenga las columnas: NOMBRES COMPLETOS, COP, COLEGIO REGIONAL'
+            );
+        }
+
+        const { imported, errors } = await bulkUpsertAgremiados(records);
+
+        return successResponse({
+            imported,
+            errors,
+            total: records.length,
+            message: `Importación completada: ${imported} registros importados${errors > 0 ? `, ${errors} con error` : ''}`,
         });
-
-        return successResponse(newAgremiado, 201);
     } catch (error) {
         return handleApiError(error);
     }
